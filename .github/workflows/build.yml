@@ -618,7 +618,7 @@ jobs:
           }
 
           echo "克隆 AnyKernel3..."
-          git clone https://github.com/WildKernels/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+          git clone https://github.com/lerdb/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
           rm -rf AnyKernel3/.git
 
           if [ "${{ inputs.enable_susfs }}" == "true" ]; then
