@@ -67,6 +67,26 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
             die("missing sucompat stat prototype")
         text = text.replace(old, new, 1)
 
+    if modern_stat and "int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv," not in text:
+        marker = "long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, struct pt_regs *regs);"
+        if marker not in text:
+            die("missing modern sucompat execve marker")
+        compat = """
+#if defined(CONFIG_KSU_SUSFS)
+int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv_user,
+                                 void *envp_user, int *__never_use_flags);
+int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+                        void *envp, int *flags);
+int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+#else
+int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+#endif
+#endif
+""".strip("\n")
+        text = text.replace(marker, marker + "\n" + compat, 1)
+
     write_if_changed(path, text, original, changed_files)
 
 
@@ -181,6 +201,128 @@ int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
 {old_func}
 #endif"""
         text = text[: match.start(1)] + new_func + text[match.end(1) :]
+
+    if modern_layout and "int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv," not in text:
+        marker = "\n// sucompat: permitted process can execute 'su' to gain root access.\n"
+        if marker not in text:
+            die(f"missing modern sucompat compat-wrapper anchor: {path}")
+        compat_block = r'''
+
+static char __user *sh_user_path(void)
+{
+    static const char sh_path_local[] = SH_PATH;
+
+    return userspace_stack_buffer(sh_path_local, sizeof(sh_path_local));
+}
+
+#ifdef CONFIG_KSU_SUSFS
+int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+                                 void *argv_user, void *envp_user,
+                                 int *__never_use_flags)
+{
+    struct filename *filename;
+    struct ksu_sulog_pending_event *pending_sucompat = NULL;
+    const char __user *const __user *argv_user_ptr = (const char __user *const __user *)argv_user;
+    int ret;
+
+    (void)fd;
+    (void)envp_user;
+    (void)__never_use_flags;
+
+    if (unlikely(!filename_ptr))
+        return 0;
+
+    filename = *filename_ptr;
+    if (IS_ERR(filename) || !filename || !filename->name)
+        return 0;
+
+    if (!ksu_is_allow_uid_for_current(current_uid().val))
+        return 0;
+
+    if (likely(memcmp(filename->name, su_path, sizeof(su_path))))
+        return 0;
+
+    pr_info("ksu_handle_execveat_sucompat: su found\n");
+    memcpy((void *)filename->name, KSUD_PATH, sizeof(KSUD_PATH));
+
+    pending_sucompat = ksu_sulog_capture_sucompat(filename->name, argv_user_ptr, GFP_KERNEL);
+
+    ret = escape_with_root_profile();
+    if (ret)
+        pr_err("escape_with_root_profile() failed: %d\n", ret);
+
+    ksu_sulog_emit_pending(pending_sucompat, ret, GFP_KERNEL);
+    return 0;
+}
+
+int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+                        void *envp, int *flags)
+{
+    return ksu_handle_execveat_sucompat(fd, filename_ptr, argv, envp, flags);
+}
+
+int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+                         int *__unused_flags)
+{
+    char path[sizeof(su_path) + 1] = {0};
+
+    (void)dfd;
+    (void)mode;
+    (void)__unused_flags;
+
+    if (unlikely(!filename_user))
+        return 0;
+
+    strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+
+    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
+        pr_info("ksu_handle_faccessat: su->sh!\n");
+        *filename_user = sh_user_path();
+    }
+
+    return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
+{
+    (void)dfd;
+    (void)flags;
+
+    if (unlikely(!filename || !*filename || IS_ERR(*filename) || !(*filename)->name))
+        return 0;
+
+    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path))))
+        return 0;
+
+    pr_info("ksu_handle_stat: su->sh!\n");
+    memcpy((void *)(*filename)->name, SH_PATH, sizeof(SH_PATH));
+    return 0;
+}
+#else
+int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+{
+    char path[sizeof(su_path) + 1] = {0};
+
+    (void)dfd;
+    (void)flags;
+
+    if (unlikely(!filename_user))
+        return 0;
+
+    strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+
+    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
+        pr_info("ksu_handle_stat: su->sh!\n");
+        *filename_user = sh_user_path();
+    }
+
+    return 0;
+}
+#endif
+#endif
+'''
+        text = text.replace(marker, compat_block + marker, 1)
 
     write_if_changed(path, text, original, changed_files)
 
@@ -984,6 +1126,9 @@ def verify(ksu_dir):
         "long ksu_handle_faccessat_sucompat(int orig_nr, struct pt_regs *regs)",
         "long ksu_handle_stat_sucompat(int orig_nr, struct pt_regs *regs)",
         "long ksu_handle_execve_sucompat(const char __user **filename_user, int orig_nr, struct pt_regs *regs)",
+        "int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,",
+        "int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,",
+        "int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,",
     )
     legacy_sucompat_markers = (
         "DEFINE_STATIC_KEY_TRUE(ksu_su_compat_enabled)",
