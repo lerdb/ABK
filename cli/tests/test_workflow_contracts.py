@@ -235,6 +235,62 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("libdw-dev", dependency_block)
         self.assertIn("zlib1g-dev", dependency_block)
 
+    def test_oneplus_official_kernelsu_uapi_is_materialized_when_symlink_is_unusable(self):
+        script = (
+            REPO_ROOT
+            / ".github"
+            / "scripts"
+            / "ensure-kernelsu-uapi.sh"
+        )
+        build_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "oneplus-build.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ensure-kernelsu-uapi.sh", build_workflow)
+        self.assertLess(
+            build_workflow.index("setup.sh"),
+            build_workflow.index("ensure-kernelsu-uapi.sh"),
+        )
+        compile_start = build_workflow.index("- name: 编译内核")
+        compile_block = build_workflow[compile_start:]
+        for include_root in (
+            "$KERNEL_ROOT/KernelSU",
+            "$KERNEL_ROOT/KernelSU/kernel",
+            "$KERNEL_ROOT/KernelSU/kernel/include",
+        ):
+            self.assertIn(f'"KCFLAGS+=-I{include_root}"', compile_block)
+        self.assertIn('"${KSU_KCFLAGS[@]}"', compile_block)
+
+        if sys.platform == "win32":
+            self.skipTest("Kernel workflow Bash integration runs on Linux only")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kernel_root = Path(tmpdir) / "kernel_platform"
+            source_dir = kernel_root / "KernelSU" / "uapi"
+            include_dir = kernel_root / "KernelSU" / "kernel" / "include" / "uapi"
+            source_dir.mkdir(parents=True)
+            include_dir.parent.mkdir(parents=True)
+            (source_dir / "app_profile.h").write_text(
+                "/* test header */\n",
+                encoding="utf-8",
+            )
+            # This is how a symlink can appear when the checkout cannot preserve it.
+            include_dir.write_text("../../uapi", encoding="utf-8")
+
+            result = subprocess.run(
+                ["bash", str(script), kernel_root.as_posix()],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("materialized", result.stdout)
+            self.assertTrue((include_dir / "app_profile.h").is_file())
+            self.assertEqual(
+                "/* test header */\n",
+                (include_dir / "app_profile.h").read_text(encoding="utf-8"),
+            )
+
     def test_kpm_support_matches_the_selected_ksu_source(self):
         cases = (
             ("SukiSU", "Stable", False, True),
