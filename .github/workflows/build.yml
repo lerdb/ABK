@@ -6645,7 +6645,73 @@ jobs:
           fi
 
           echo "ABK Control 管理器桥接校验通过。"
+          
+      - name: 补齐 GKI module_outs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+          BUILD_FILE="common/BUILD.bazel"
 
+          if [ ! -f "$BUILD_FILE" ]; then
+            echo "未找到 $BUILD_FILE，跳过 module_outs 补齐。"
+            exit 0
+          fi
+
+          if grep -qF '"drivers/net/macvlan.ko"' "$BUILD_FILE" \
+            && grep -qF '"fs/ntfs3/ntfs3.ko"' "$BUILD_FILE"; then
+            echo "module_outs 已包含 macvlan.ko 和 ntfs3.ko，跳过。"
+            exit 0
+          fi
+
+          if command -v buildozer >/dev/null 2>&1; then
+            echo "使用 buildozer 补齐 module_outs..."
+            buildozer 'add module_outs drivers/net/macvlan.ko' @//common:kernel_aarch64
+            buildozer 'add module_outs fs/ntfs3/ntfs3.ko' @//common:kernel_aarch64
+          else
+            echo "未找到 buildozer，使用 Python 直接修改 $BUILD_FILE..."
+            python3 - "$BUILD_FILE" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          entries = [
+              '"drivers/net/macvlan.ko"',
+              '"fs/ntfs3/ntfs3.ko"',
+          ]
+          missing = [e for e in entries if e not in text]
+          if not missing:
+              print("module_outs 已包含目标模块，无需修改。")
+              raise SystemExit(0)
+
+          matches = list(re.finditer(r"module_outs\s*=\s*\[", text))
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"module_outs 出现 {len(matches)} 次，无法安全自动插入；"
+                  "请手动在 @//common:kernel_aarch64 的 module_outs 中添加："
+                  " drivers/net/macvlan.ko fs/ntfs3/ntfs3.ko"
+              )
+
+          match = matches[0]
+          insert_at = match.end()
+          end = text.find("]", insert_at)
+          if end == -1:
+              raise SystemExit("未找到 module_outs 列表结束符 ]")
+
+          insert = "\n        " + ",\n        ".join(missing) + ","
+          text = text[:insert_at] + insert + text[insert_at:]
+          path.write_text(text)
+          print("已插入 module_outs:", ", ".join(missing))
+          PY
+          fi
+
+          echo "===== module_outs 检查 ====="
+          grep -n 'macvlan.ko\|ntfs3.ko' "$BUILD_FILE" || {
+            echo "::error::module_outs 补齐后仍未找到目标模块"
+            exit 1
+          }
+          
       - name: 编译内核
         uses: nick-fields/retry@v4
         with:
